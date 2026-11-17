@@ -61,6 +61,7 @@ void PollSprime(PollContext& ctx);    // Sprime PM1 (1915:AC1C / AD8C receivers,
 void PollRongyuan(PollContext& ctx);  // Rongyuan receivers (Attack Shark, Ajazz keyboards, ...)
 void PollSonyInzone(PollContext& ctx);  // Sony INZONE H9 II / H5 / Buds
 void PollSonix(PollContext& ctx);     // SONiX keyboards on their 2.4 GHz dongle (AJAZZ AK820 MAX, AK980 V2, AULA F108 Pro)
+void PollSemico(PollContext& ctx);    // Semico 1A2C keyboards (Attack Shark X98, AJAZZ AK820 Max Plus) on 8FFF / A034 / A036
 void PollFractal(PollContext& ctx);   // Fractal Design Scape headset (dongle or cable)
 void PollJabra(PollContext& ctx);     // Jabra headsets behind a Link 380 / 390 dongle
 void PollJbl(PollContext& ctx);       // JBL Quantum 520 / 650 / 850 / 950 wireless headsets
