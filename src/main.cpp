@@ -30,6 +30,7 @@ constexpr UINT PLACEHOLDER_ID = 1;
 
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_REPORT,
+    ID_MONITOR_ALL = 300, ID_MONITOR_MAIN, ID_MONITOR_FIRST,  // "Show the widget on": ID_MONITOR_FIRST + 0..31
     ID_DEVICE_FIRST = 1000
 };
 enum DeviceCmd : UINT { DEV_TOGGLE, DEV_LEFT, DEV_RIGHT, DEV_STRIDE = 4 };
@@ -48,6 +49,7 @@ bool g_lightTaskbar;
 bool g_wantWidget = true;      // user's choice: taskbar widget (default) or tray icons
 bool g_useWidget = false;      // what is actually shown right now
 bool g_hideLastKnown = false;  // hide (last known) / asleep devices from taskbar and tray
+std::wstring g_widgetMonitor = L"all";  // which taskbars show the widget: "all", "main" or one monitor id
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
 
 struct TrayEntry {
@@ -161,6 +163,21 @@ bool LoadHideLastKnown() { return LoadBoolSetting(L"HideLastKnownDevices", false
 void SaveHideLastKnown(bool on) { SaveBoolSetting(L"HideLastKnownDevices", on); }
 bool LoadWidgetBackground() { return LoadBoolSetting(L"WidgetBackground", false); }
 void SaveWidgetBackground(bool on) { SaveBoolSetting(L"WidgetBackground", on); }
+std::wstring LoadWidgetMonitor() {
+    wchar_t buf[512] = {};
+    DWORD size = sizeof(buf) - sizeof(wchar_t);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"WidgetMonitor", RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS && buf[0])
+        return buf;
+    return LoadBoolSetting(L"OtherTaskbars", true) ? L"all" : L"main";  // the earlier on/off toggle
+}
+void SaveWidgetMonitor(const std::wstring& v) {
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"WidgetMonitor", REG_SZ, v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+}
+void SetWidgetMonitor(const std::wstring& v) {
+    g_widgetMonitor = v;
+    SaveWidgetMonitor(v);
+    widget::SetMonitorChoice(v);
+}
 
 bool AutostartEnabled() {
     wchar_t buf[MAX_PATH * 2];
@@ -585,6 +602,27 @@ void ShowMenu() {
     CheckMenuRadioItem(m, ID_MODE_WIDGET, ID_MODE_TRAY, g_wantWidget ? ID_MODE_WIDGET : ID_MODE_TRAY, MF_BYCOMMAND);
     UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
     AppendMenuW(m, bgFlags, ID_WIDGET_BACKGROUND, L"Background behind taskbar text (for transparent taskbars)");
+    // With more than one monitor: choose which taskbars show the widget (all, main only, or one monitor).
+    auto monitors = widget::OtherMonitors();
+    if (monitors.size() > 31) monitors.resize(31);
+    if (!monitors.empty()) {
+        HMENU sub = CreatePopupMenu();
+        UINT f = MF_STRING | (g_wantWidget ? 0 : MF_GRAYED);
+        AppendMenuW(sub, f, ID_MONITOR_ALL, L"All monitors");
+        AppendMenuW(sub, f, ID_MONITOR_MAIN, L"Main monitor only");
+        UINT checked = g_widgetMonitor == L"main" ? ID_MONITOR_MAIN : ID_MONITOR_ALL;
+        bool found = g_widgetMonitor == L"all" || g_widgetMonitor == L"main";
+        for (UINT i = 0; i < monitors.size(); i++) {
+            AppendMenuW(sub, f, ID_MONITOR_FIRST + i, (monitors[i].label + L" only").c_str());
+            if (monitors[i].id == g_widgetMonitor) { checked = ID_MONITOR_FIRST + i; found = true; }
+        }
+        if (!found) {  // the chosen monitor is unplugged: the main taskbar shows the widget meanwhile
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, ID_MONITOR_FIRST + 31, L"Chosen monitor (not connected, shown on main)");
+            checked = ID_MONITOR_FIRST + 31;
+        }
+        CheckMenuRadioItem(sub, ID_MONITOR_ALL, ID_MONITOR_FIRST + 31, checked, MF_BYCOMMAND);
+        AppendMenuW(m, MF_POPUP | (g_wantWidget ? 0 : MF_GRAYED), (UINT_PTR)sub, L"Show the widget on");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_REFRESH, L"Refresh now");
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
@@ -603,13 +641,17 @@ void ShowMenu() {
         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
         case ID_HIDE_LAST_KNOWN: SetHideLastKnown(!g_hideLastKnown); break;
         case ID_WIDGET_BACKGROUND: SetWidgetBackground(!g_widgetBackground); break;
+        case ID_MONITOR_ALL: SetWidgetMonitor(L"all"); break;
+        case ID_MONITOR_MAIN: SetWidgetMonitor(L"main"); break;
         case ID_MODE_WIDGET: SetMode(true); break;
         case ID_MODE_TRAY: SetMode(false); break;
         case ID_SUPPORT: ShellExecuteW(nullptr, L"open", L"https://github.com/sponsors/krisgfx9", nullptr, nullptr, SW_SHOWNORMAL); break;
         case ID_REPORT: report::Show(g_inst, g_hwnd); break;
         case ID_EXIT: DestroyWindow(g_hwnd); break;
         default:
-            if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
+            if (cmd >= ID_MONITOR_FIRST && cmd < ID_MONITOR_FIRST + monitors.size()) {
+                SetWidgetMonitor(monitors[cmd - ID_MONITOR_FIRST].id);
+            } else if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
                 std::wstring key = keys[(cmd - ID_DEVICE_FIRST) / DEV_STRIDE];
                 switch ((cmd - ID_DEVICE_FIRST) % DEV_STRIDE) {
                     case DEV_TOGGLE: ToggleHidden(key); break;
@@ -800,6 +842,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_hideLastKnown = LoadHideLastKnown();
     g_widgetBackground = LoadWidgetBackground();
     widget::SetBackground(g_widgetBackground);  // remembered by the widget across re-creation
+    g_widgetMonitor = LoadWidgetMonitor();
+    widget::SetMonitorChoice(g_widgetMonitor);
     LoadHidden();
     LoadOrder();
     Reconcile();

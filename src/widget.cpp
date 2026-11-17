@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <uiautomation.h>
 #include <algorithm>
+#include <climits>
 
 namespace {
 
@@ -15,11 +16,31 @@ std::wstring g_tipText;
 RECT g_lastTray{}, g_lastBar{}, g_lastWidgets{};
 int g_lastW = -1, g_lastDpi = 0, g_lastLeft = -1;
 SIZE g_size{};
+HINSTANCE g_inst;
+
+// Copies of the strip on secondary-monitor taskbars (Shell_SecondaryTrayWnd), so the levels stay visible
+// while a game runs fullscreen on the main screen. Same drawing, same click and tooltip; each one sits
+// left of its taskbar's clock. The primary strip above is unchanged, and with one monitor none exist.
+struct Mirror {
+    HWND bar = nullptr, wnd = nullptr;
+    bool hover = false;
+    SIZE size{};
+    int dpi = 0;
+    int lastLeft = INT_MIN;  // client x it was last placed at; INT_MIN = not placed (hidden)
+};
+std::vector<Mirror> g_mirrors;
+// Which taskbars show the strip: "all", "main", or one monitor's id (MonitorId), e.g. only monitor 3.
+// With one monitor chosen, the primary strip is hidden; if that monitor is not connected, the primary
+// strip is shown instead so the levels never disappear.
+std::wstring g_choice = L"all";
+bool g_primaryHidden = false;
+HWND g_dpiBar;  // while a mirror is painted or placed, Px() uses its taskbar's DPI
 
 const wchar_t* kClass = L"WirelessBatteryWidget";
 
 int Dpi() {
-    UINT d = g_taskbar ? GetDpiForWindow(g_taskbar) : 0;
+    HWND bar = g_dpiBar ? g_dpiBar : g_taskbar;
+    UINT d = bar ? GetDpiForWindow(bar) : 0;
     return d ? (int)d : 96;
 }
 int Px(int v) { return MulDiv(v, Dpi(), 96); }
@@ -39,6 +60,81 @@ RECT g_wbRect{};             // last Widgets button rectangle (screen), empty wh
 HWND g_wbRectBar;            // taskbar g_wbRect was found in (guarded by g_wbLock)
 HWND g_wbTaskbar;            // taskbar to search, null while there is no widget (guarded by g_wbLock)
 HANDLE g_wbWake;             // auto-reset: wakes the lookup thread early
+
+// Where a Windows 11 secondary taskbar's clock and task buttons are. Its XAML has no child windows for
+// them, so the same lookup thread reads them with UI Automation (the clock has AutomationId
+// "SystemTrayIcon", task buttons class "Taskbar.TaskListButtonAutomationPeer"; found by PR #107).
+struct Span {
+    HWND bar = nullptr;
+    bool measured = false;   // UI Automation answered for this taskbar
+    bool hasClock = false;   // the clock can be turned off on secondary taskbars
+    int clockLeft = 0;       // screen x
+    bool hasTasks = false;
+    int tasksRight = 0;      // right edge of the last task button left of the clock (screen x)
+};
+std::vector<Span> g_spans;   // guarded by g_wbLock
+bool g_wbMirrors;            // guarded by g_wbLock: measure secondary taskbars too
+
+IUIAutomationCondition* StringCondition(IUIAutomation* uia, PROPERTYID prop, const wchar_t* value) {
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_BSTR;
+    v.bstrVal = SysAllocString(value);
+    IUIAutomationCondition* c = nullptr;
+    if (v.bstrVal) uia->CreatePropertyCondition(prop, v, &c);
+    VariantClear(&v);
+    return c;
+}
+
+Span MeasureSpan(IUIAutomation* uia, HWND bar) {
+    Span s;
+    s.bar = bar;
+    RECT br{};
+    IUIAutomationElement* root = nullptr;
+    if (!GetWindowRect(bar, &br) || FAILED(uia->ElementFromHandle(bar, &root)) || !root) return s;
+    s.measured = true;
+    auto inBar = [&](const RECT& r) { return r.right > r.left && r.left >= br.left && r.right <= br.right; };
+    if (IUIAutomationCondition* clock = StringCondition(uia, UIA_AutomationIdPropertyId, L"SystemTrayIcon")) {
+        IUIAutomationElementArray* all = nullptr;
+        int n = 0;
+        if (SUCCEEDED(root->FindAll(TreeScope_Descendants, clock, &all)) && all && SUCCEEDED(all->get_Length(&n)))
+            for (int i = 0; i < n; i++) {  // leftmost of the clock area's buttons
+                IUIAutomationElement* el = nullptr;
+                RECT r{};
+                if (SUCCEEDED(all->GetElement(i, &el)) && el && SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && inBar(r) &&
+                    (!s.hasClock || r.left < s.clockLeft)) {
+                    s.clockLeft = r.left;
+                    s.hasClock = true;
+                }
+                if (el) el->Release();
+            }
+        if (all) all->Release();
+        clock->Release();
+    }
+    if (IUIAutomationCondition* task = StringCondition(uia, UIA_ClassNamePropertyId, L"Taskbar.TaskListButtonAutomationPeer")) {
+        IUIAutomationElementArray* all = nullptr;
+        int n = 0;
+        if (SUCCEEDED(root->FindAll(TreeScope_Descendants, task, &all)) && all && SUCCEEDED(all->get_Length(&n)))
+            for (int i = 0; i < n; i++) {
+                IUIAutomationElement* el = nullptr;
+                RECT r{};
+                if (SUCCEEDED(all->GetElement(i, &el)) && el && SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && inBar(r) &&
+                    (!s.hasClock || r.right <= s.clockLeft) && (!s.hasTasks || r.right > s.tasksRight)) {
+                    s.tasksRight = r.right;
+                    s.hasTasks = true;
+                }
+                if (el) el->Release();
+            }
+        if (all) all->Release();
+        task->Release();
+    }
+    root->Release();
+    return s;
+}
+
+bool IsXamlTaskbar(HWND bar) {
+    return FindWindowExW(bar, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr) != nullptr;
+}
 
 DWORD WINAPI WidgetsButtonThread(LPVOID) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -76,11 +172,20 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
                 r = {};
             }
         }
+        AcquireSRWLockShared(&g_wbLock);
+        bool mirrors = g_wbMirrors;
+        ReleaseSRWLockShared(&g_wbLock);
+        std::vector<Span> spans;
+        if (bar && mirrors && uia)
+            for (HWND t = FindWindowExW(nullptr, nullptr, L"Shell_SecondaryTrayWnd", nullptr); t;
+                 t = FindWindowExW(nullptr, t, L"Shell_SecondaryTrayWnd", nullptr))
+                if (IsXamlTaskbar(t)) spans.push_back(MeasureSpan(uia, t));  // Windows 10 bars have real child windows
         AcquireSRWLockExclusive(&g_wbLock);
         if (bar && g_wbTaskbar == bar) {  // drop a result for a taskbar we no longer sit on
             g_wbRect = r;
             g_wbRectBar = bar;
         }
+        g_spans = std::move(spans);
         ReleaseSRWLockExclusive(&g_wbLock);
     }
 }
@@ -250,10 +355,10 @@ std::vector<Piece> Layout(int& width) {
     return out;
 }
 
-void Paint() {
-    if (!g_wnd) return;
+// Draws the strip for one window: the primary one or a mirror on a secondary taskbar.
+void PaintStrip(HWND wnd, HWND taskbar, bool hover, SIZE& size) {
     RECT bar;
-    GetClientRect(g_taskbar, &bar);
+    GetClientRect(taskbar, &bar);
     int H = bar.bottom - bar.top;
     int W = 0;
     auto pieces = Layout(W);
@@ -274,7 +379,7 @@ void Paint() {
     // Optional plate in the taskbar's own colours: keeps the text readable when a taskbar theme
     // (e.g. Windhawk's Taskbar Styler) makes the bar transparent over the wallpaper.
     if (g_background) roundRect(Px(4), Px(6), g_light ? Rgb{ 243, 243, 243 } : Rgb{ 32, 32, 32 }, 240);
-    if (g_hover) roundRect(Px(4), Px(4), g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }, g_light ? 20 : 26);
+    if (hover) roundRect(Px(4), Px(4), g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }, g_light ? 20 : 26);
 
     int x = Px(8);
     for (auto& p : pieces) {
@@ -290,33 +395,231 @@ void Paint() {
     HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     memcpy(bits, cv.px.data(), (size_t)W * H * 4);
     HGDIOBJ ob = SelectObject(mem, bmp);
-    g_size = { W, H };
+    size = { W, H };
     SIZE sz{ W, H };
     POINT src{ 0, 0 };
     BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-    UpdateLayeredWindow(g_wnd, screen, nullptr, &sz, mem, &src, 0, &bf, ULW_ALPHA);
+    UpdateLayeredWindow(wnd, screen, nullptr, &sz, mem, &src, 0, &bf, ULW_ALPHA);
     SelectObject(mem, ob);
     DeleteObject(bmp);
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+}
+
+void Paint() {
+    if (!g_wnd) return;
+    PaintStrip(g_wnd, g_taskbar, g_hover, g_size);
     g_lastW = -1;  // force a re-position with the new size
+}
+
+void PaintMirror(Mirror& m) {
+    g_dpiBar = m.bar;
+    m.dpi = Dpi();
+    PaintStrip(m.wnd, m.bar, m.hover, m.size);
+    g_dpiBar = nullptr;
+    m.lastLeft = INT_MIN;  // force a re-position with the new size
+}
+
+void HideMirror(Mirror& m) {
+    if (m.lastLeft != INT_MIN || IsWindowVisible(m.wnd)) ShowWindow(m.wnd, SW_HIDE);
+    m.lastLeft = INT_MIN;
+}
+
+// Places a mirror left of its taskbar's clock, or hides it when that spot is unknown or taken by task
+// buttons: never guess and cover something.
+void PositionMirror(Mirror& m) {
+    RECT bar{};
+    if (!GetWindowRect(m.bar, &bar) || (GetWindowLongW(m.bar, GWL_EXSTYLE) & WS_EX_LAYOUTRTL)) { HideMirror(m); return; }
+    g_dpiBar = m.bar;
+    if (Dpi() != m.dpi || m.size.cy != bar.bottom - bar.top) PaintMirror(m), g_dpiBar = m.bar;
+    int right = 0, minLeft = bar.left;
+    bool known = false;
+    if (!IsXamlTaskbar(m.bar)) {  // Windows 10: the clock is a real child window (absent when it is turned off)
+        HWND clock = FindWindowExW(m.bar, nullptr, L"ClockButton", nullptr);
+        RECT cr{};
+        right = clock && IsWindowVisible(clock) && GetWindowRect(clock, &cr) ? cr.left : bar.right - Px(8);
+        known = true;
+    } else {
+        AcquireSRWLockShared(&g_wbLock);
+        for (const auto& s : g_spans)
+            if (s.bar == m.bar && s.measured) {
+                right = s.hasClock ? s.clockLeft : bar.right - Px(8);
+                if (s.hasTasks) minLeft = s.tasksRight + Px(4);
+                known = true;
+            }
+        ReleaseSRWLockShared(&g_wbLock);
+    }
+    DWORD offset = 0, sz = sizeof(offset);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", L"TaskbarOffset", RRF_RT_REG_DWORD, nullptr, &offset, &sz) ==
+        ERROR_SUCCESS)
+        right -= Px((int)offset);
+    int left = right - m.size.cx - Px(2);
+    g_dpiBar = nullptr;
+    if (!known || m.size.cx <= 0 || left < minLeft) { HideMirror(m); return; }
+    POINT p{ left, bar.top };
+    ScreenToClient(m.bar, &p);
+    bool covered = GetWindow(m.wnd, GW_HWNDPREV) != nullptr;
+    if (!covered && p.x == m.lastLeft) return;
+    m.lastLeft = p.x;
+    SetWindowPos(m.wnd, HWND_TOP, p.x, 0, m.size.cx, m.size.cy, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void AddTool(HWND w) {
+    if (!g_tip) return;
+    TTTOOLINFOW ti{ sizeof(ti) };
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = g_notify;
+    ti.uId = (UINT_PTR)w;
+    ti.lpszText = const_cast<wchar_t*>(g_tipText.empty() ? L"Wireless Battery" : g_tipText.c_str());
+    SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+void DestroyMirror(Mirror& m) {
+    if (g_tip) {
+        TTTOOLINFOW ti{ sizeof(ti) };
+        ti.hwnd = g_notify;
+        ti.uId = (UINT_PTR)m.wnd;
+        SendMessageW(g_tip, TTM_DELTOOLW, 0, (LPARAM)&ti);
+    }
+    if (m.wnd && IsWindow(m.wnd)) DestroyWindow(m.wnd);
+    m.wnd = nullptr;
+}
+
+void SetMeasureMirrors(bool on) {
+    AcquireSRWLockExclusive(&g_wbLock);
+    bool changed = g_wbMirrors != on;
+    g_wbMirrors = on;
+    ReleaseSRWLockExclusive(&g_wbLock);
+    if (changed && on && g_wbWake) SetEvent(g_wbWake);  // measure the new taskbar now, not in 5 s
+}
+
+std::vector<HWND> SecondaryTaskbars() {
+    std::vector<HWND> out;
+    for (HWND t = FindWindowExW(nullptr, nullptr, L"Shell_SecondaryTrayWnd", nullptr); t;
+         t = FindWindowExW(nullptr, t, L"Shell_SecondaryTrayWnd", nullptr)) {
+        RECT r{};
+        if (IsWindowVisible(t) && GetWindowRect(t, &r) && r.right - r.left > r.bottom - r.top) out.push_back(t);  // horizontal only
+    }
+    return out;
+}
+
+// Keeps one mirror per secondary taskbar: adds them for new monitors, removes them for gone ones.
+// Called from Reposition() about once a second; with one monitor it is a single FindWindowEx call.
+// A monitor's lasting identity: its device interface name, which survives reboots, Explorer restarts and
+// Windows renumbering the displays (falls back to "\\.\DISPLAYn").
+std::wstring MonitorId(HWND bar) {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromWindow(bar, MONITOR_DEFAULTTONULL);
+    if (!mon || !GetMonitorInfoW(mon, &mi)) return L"";
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    if (EnumDisplayDevicesW(mi.szDevice, 0, &dd, EDD_GET_DEVICE_INTERFACE_NAME) && dd.DeviceID[0]) return dd.DeviceID;
+    return mi.szDevice;
+}
+
+// "Display 3 (right)": the number Windows gives the display and where it sits next to the main one.
+std::wstring MonitorLabel(HWND bar) {
+    MONITORINFOEXW mi{}, pm{};
+    mi.cbSize = pm.cbSize = sizeof(MONITORINFOEXW);
+    HMONITOR mon = MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST);
+    if (!GetMonitorInfoW(mon, &mi)) return L"Other monitor";
+    std::wstring dev = mi.szDevice;
+    size_t d = dev.find(L"DISPLAY");
+    std::wstring label = d != std::wstring::npos ? L"Display " + dev.substr(d + 7) : L"Other monitor";
+    POINT origin{ 0, 0 };
+    if (GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &pm)) {
+        int dx = (mi.rcMonitor.left + mi.rcMonitor.right - pm.rcMonitor.left - pm.rcMonitor.right) / 2;
+        int dy = (mi.rcMonitor.top + mi.rcMonitor.bottom - pm.rcMonitor.top - pm.rcMonitor.bottom) / 2;
+        label += abs(dx) >= abs(dy) ? (dx < 0 ? L" (left)" : L" (right)") : (dy < 0 ? L" (above)" : L" (below)");
+    }
+    return label;
+}
+
+// Hides or shows the strip on the main taskbar (it keeps running, just out of sight).
+void SetPrimaryHidden(bool hide) {
+    if (hide == g_primaryHidden || !g_wnd) return;
+    g_primaryHidden = hide;
+    if (hide) {
+        ShowWindow(g_wnd, SW_HIDE);
+        if (g_rebar && IsWindow(g_rebar)) {  // Windows 10: give the task buttons their full width back
+            RECT r;
+            GetClientRect(g_taskbar, &r);
+            PostMessageW(g_taskbar, WM_SIZE, SIZE_RESTORED, MAKELPARAM(r.right, r.bottom));
+        }
+    }
+    g_lastW = -1;  // re-place (and show) on the next pass
+}
+
+void SyncMirrors() {
+    std::vector<HWND> all = g_wnd ? SecondaryTaskbars() : std::vector<HWND>{}, bars;
+    bool chosenFound = false;
+    if (g_choice == L"all") {
+        bars = all;
+    } else if (g_choice != L"main") {
+        for (HWND b : all)
+            if (MonitorId(b) == g_choice) {
+                bars.push_back(b);
+                chosenFound = true;
+                break;
+            }
+    }
+    SetPrimaryHidden(chosenFound);
+    for (auto it = g_mirrors.begin(); it != g_mirrors.end();) {
+        if (std::find(bars.begin(), bars.end(), it->bar) == bars.end() || !IsWindow(it->wnd)) {
+            DestroyMirror(*it);
+            it = g_mirrors.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (HWND b : bars) {
+        if (std::any_of(g_mirrors.begin(), g_mirrors.end(), [b](const Mirror& m) { return m.bar == b; })) continue;
+        Mirror m;
+        m.bar = b;
+        m.wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE, kClass, L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 1, 1, b, nullptr,
+                                g_inst, nullptr);
+        if (!m.wnd) continue;
+        AddTool(m.wnd);
+        g_mirrors.push_back(m);
+        PaintMirror(g_mirrors.back());
+    }
+    SetMeasureMirrors(!g_mirrors.empty());
+    for (auto& m : g_mirrors) PositionMirror(m);
+}
+
+void PaintAll() {
+    Paint();
+    for (auto& m : g_mirrors) PaintMirror(m);
+}
+
+// Hover highlight for the strip under the mouse: the primary one or a mirror.
+void SetHover(HWND h, bool on) {
+    if (h == g_wnd) {
+        if (g_hover == on) return;
+        g_hover = on;
+        Paint();
+        widget::Reposition();
+        return;
+    }
+    for (auto& m : g_mirrors)
+        if (m.wnd == h && m.hover != on) {
+            m.hover = on;
+            PaintMirror(m);
+            PositionMirror(m);
+        }
 }
 
 LRESULT CALLBACK WidgetProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_MOUSEMOVE:
-            if (!g_hover) {
-                g_hover = true;
-                TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, h, 0 };
-                TrackMouseEvent(&t);
-                Paint();
-                widget::Reposition();
-            }
+        case WM_MOUSEMOVE: {
+            TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&t);
+            SetHover(h, true);
             return 0;
+        }
         case WM_MOUSELEAVE:
-            g_hover = false;
-            Paint();
-            widget::Reposition();
+            SetHover(h, false);
             return 0;
         case WM_LBUTTONUP:
         case WM_RBUTTONUP:
@@ -347,6 +650,7 @@ bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme) {
     g_notify = notifyWnd;
     g_clickMsg = clickMsg;
     g_light = lightTheme;
+    g_inst = inst;
 
     static bool registered = false;
     if (!registered) {
@@ -380,7 +684,7 @@ bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme) {
     Paint();
     g_lastW = -1;
     Reposition();
-    ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
+    if (!g_primaryHidden) ShowWindow(g_wnd, SW_SHOWNOACTIVATE);  // hidden when only another monitor is chosen
     return true;
 }
 
@@ -392,6 +696,10 @@ void Destroy() {
         PostMessageW(g_taskbar, WM_SIZE, SIZE_RESTORED, MAKELPARAM(r.right, r.bottom));
     }
     g_rebar = nullptr;
+    for (auto& m : g_mirrors) DestroyMirror(m);
+    g_mirrors.clear();
+    SetMeasureMirrors(false);
+    g_primaryHidden = false;  // the next Create() decides again
     if (g_wbWake) WatchWidgetsButton(nullptr);
     if (g_tip) { DestroyWindow(g_tip); g_tip = nullptr; }
     if (g_wnd) { DestroyWindow(g_wnd); g_wnd = nullptr; }
@@ -407,27 +715,46 @@ void SetItems(const std::vector<WidgetItem>& items, const std::wstring& tooltip)
         g_tipText = tooltip;
         TTTOOLINFOW ti{ sizeof(ti) };
         ti.hwnd = g_notify;
-        ti.uId = (UINT_PTR)g_wnd;
         ti.lpszText = const_cast<wchar_t*>(g_tipText.c_str());
+        ti.uId = (UINT_PTR)g_wnd;
         SendMessageW(g_tip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+        for (const auto& m : g_mirrors) {
+            ti.uId = (UINT_PTR)m.wnd;
+            SendMessageW(g_tip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+        }
     }
-    Paint();
+    PaintAll();
     Reposition();
 }
 
 void SetLightTheme(bool light) {
     g_light = light;
     ApplyTipTheme();
-    Paint();
+    PaintAll();
 }
 
 void SetBackground(bool on) {
     g_background = on;
-    Paint();
+    PaintAll();
+}
+
+void SetMonitorChoice(const std::wstring& choice) {
+    g_choice = choice.empty() ? L"all" : choice;
+    SyncMirrors();  // adds, removes or hides strips right away
+    if (g_wnd) Reposition();
+}
+
+std::vector<MonitorOption> OtherMonitors() {
+    std::vector<MonitorOption> out;
+    for (HWND b : SecondaryTaskbars()) out.push_back({ MonitorId(b), MonitorLabel(b) });
+    std::sort(out.begin(), out.end(), [](const MonitorOption& a, const MonitorOption& b) { return a.label < b.label; });
+    return out;
 }
 
 bool Reposition() {
     if (!Alive()) return false;
+    SyncMirrors();
+    if (g_primaryHidden) return true;  // only another monitor's taskbar shows the strip
     if (Dpi() != g_lastDpi) { g_lastDpi = Dpi(); Paint(); }
     HWND tray = FindWindowExW(g_taskbar, nullptr, L"TrayNotifyWnd", nullptr);
     if (!tray) return true;
